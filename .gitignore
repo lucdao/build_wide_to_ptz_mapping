@@ -1,0 +1,20 @@
+# Camera captures, calibration outputs, and extracted model artifacts
+runs/
+run_*/
+validation_*/
+*.jpg
+*.jpeg
+*.png
+*.npz
+*.pth
+*.pt
+*.log
+
+# Local environment and credentials
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
