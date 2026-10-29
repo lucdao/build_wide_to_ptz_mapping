@@ -18,6 +18,7 @@ import numpy as np
 from scipy.interpolate import PchipInterpolator
 
 from fit_polynomial_wide_to_grid import design_matrix, normalize_points
+from export_runtime_lut import validate_runtime_model
 
 
 PIPELINE_DIR = Path(__file__).resolve().parent
@@ -72,11 +73,15 @@ def main() -> int:
 
     path = (args.mapping or latest_mapping()).resolve()
     data = json.loads(path.read_text(encoding="utf-8"))
-    model = data.get("model") or data.get("global_mapping")
+    model = data.get("global_mapping") or data.get("model")
     if model is None:
         raise RuntimeError("Mapping không có model hoặc global_mapping.")
+    if "global_mapping" in data:
+        validate_runtime_model(model)
     grid = np.asarray(model["state_grid_actual_after_capture"], dtype=np.float64)
-    coefficients = np.asarray(model["linearity_probe"]["affine_coefficients_intercept_u_v"], dtype=np.float64)
+    coefficients = np.zeros((3, 3), dtype=np.float64)
+    if model["state_surface"] == "affine":
+        coefficients = np.asarray(model["linearity_probe"]["affine_coefficients_intercept_u_v"], dtype=np.float64)
     surface = PoseSurface(grid, model["state_surface"], coefficients)
     point = np.asarray([[args.x, args.y]], dtype=np.float64)
     if "H_wide_pixel_to_ptz_lattice" in model:

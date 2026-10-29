@@ -2,7 +2,7 @@
 """Capture a resumable PTZ calibration grid from camera-reported ONVIF limits.
 
 By default the script asks the connected camera for its AbsolutePanTilt and
-AbsoluteZoom spaces, then creates 30 pan samples x 6 tilt samples (180 raw
+AbsoluteZoom spaces, then creates 5 pan samples x 6 tilt samples (30 raw
 images). No camera-specific tilt interval is hard-coded. If ONVIF returns a
 non-finite, out-of-range, stale, or otherwise unusable pose, the metadata
 keeps the raw report and uses the commanded target as the normalized pose.
@@ -179,13 +179,15 @@ def make_axis_values(
     return [float(value) for value in np.linspace(limits["min"], limits["max"], count)]
 
 
-def raw_position(ptz: Any, profile_token: str) -> dict[str, float]:
+def raw_position(ptz: Any, profile_token: str, *, require_zoom: bool = False) -> dict[str, float]:
     status = ptz.GetStatus({"ProfileToken": profile_token})
     position = getattr(status, "Position", None)
     pan_tilt = getattr(position, "PanTilt", None) if position is not None else None
     if pan_tilt is None:
         raise RuntimeError("ONVIF GetStatus không trả về Position.PanTilt.")
     zoom_object = getattr(position, "Zoom", None)
+    if require_zoom and zoom_object is None:
+        raise RuntimeError("ONVIF GetStatus không trả Position.Zoom dù camera công bố zoom position space.")
     return {
         "pan": float(pan_tilt.x),
         "tilt": float(pan_tilt.y),
@@ -244,7 +246,7 @@ def wait_for_command_pose(
     unchanged_raw_samples = 0
     while time.monotonic() < deadline:
         try:
-            raw = raw_position(ptz, profile_token)
+            raw = raw_position(ptz, profile_token, require_zoom=limits.get("zoom") is not None)
             if last_raw is not None and all(abs(raw[axis] - last_raw[axis]) <= 1e-6 for axis in ("pan", "tilt", "zoom")):
                 unchanged_raw_samples += 1
             else:
@@ -318,7 +320,7 @@ def read_and_normalize_after_capture(
     last_error: str | None = None
     while time.monotonic() < deadline:
         try:
-            raw = raw_position(ptz, profile_token)
+            raw = raw_position(ptz, profile_token, require_zoom=limits.get("zoom") is not None)
             normalized, normalization = normalize_position(
                 raw, target, limits, tolerance, force_target_on_mismatch=True
             )

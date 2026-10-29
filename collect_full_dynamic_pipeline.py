@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture a complete unknown-camera Wide/PTZ calibration run.
+"""Record four Wide-corner PTZ poses, then capture a 5x6 calibration grid.
 
 The output layout is intentionally compatible with ``build_wide_ptz_mapping``:
 
@@ -7,18 +7,19 @@ The output layout is intentionally compatible with ``build_wide_ptz_mapping``:
       00_wide_current_and_new_set/
       01_ptz_overlap_grid/
 
-Unlike the legacy collector, PTZ pan/tilt samples are generated from the
-camera's ONVIF Absolute*PositionSpace.  Raw status and the canonical command
-target are both retained in metadata; a bad/stale status never contaminates
-the calibration state used by the fitting stages.
+By default the operator manually aims the PTZ centre at the four Wide
+corners. Bilinear pose interpolation generates the 30 acquisition targets.
+--auto-ranges selects the older camera-range acquisition mode instead.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -27,6 +28,11 @@ from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import cv2
+
+from corner_grid import (
+    CORNER_LABELS, CORNER_ORDER, build_corner_plan, corner_pixels,
+    read_stable_pose, validate_corners, validate_pose,
+)
 
 
 PIPELINE_DIR = Path(__file__).resolve().parent
@@ -43,9 +49,14 @@ from collect_ptz_pan_tilt_grid import (  # noqa: E402
     discover_onvif_ranges,
     make_axis_values,
     position_dict,
+    raw_position,
     read_and_normalize_after_capture,
     wait_for_command_pose,
 )
+
+
+class CalibrationCancelled(RuntimeError):
+    """The operator intentionally ended the corner-selection session."""
 
 
 def utc_now() -> str:
@@ -157,6 +168,92 @@ def capture_wide(args: argparse.Namespace, run_root: Path) -> dict[str, Any]:
     return {"reference_width": width, "reference_height": height, "metadata": metadata}
 
 
+def record_wide_corners(
+    args: argparse.Namespace, run_root: Path, wide: dict[str, Any],
+    ptz: Any, token: str, ranges: dict[str, Any], operator: Any = None,
+) -> dict[str, Any]:
+    """Teach corners using the integrated viewer or the original terminal prompts."""
+    if args.preview and operator is None:
+        from calibration_preview import CornerPreview
+        with CornerPreview(args, ptz, token, ranges, build_ptz_rtsp_url(args)) as viewer:
+            return record_wide_corners(args, run_root, wide, ptz, token, ranges, operator=viewer)
+    width, height = wide["reference_width"], wide["reference_height"]
+    path = run_root / "00_corner_anchors" / "wide_corners.json"
+    reference_image = "00_wide_current_and_new_set/current_reference/wide_current_reference.jpg"
+    document = {
+        "schema_version": 1, "status": "incomplete",
+        "method": "four_corner_bilinear_ptz",
+        "camera": {"onvif_host": args.ptz_host, "onvif_port": args.ptz_port, "profile_token": token},
+        "wide_reference": {
+            "image": reference_image, "width": width, "height": height,
+            "stream_url": redact_url(args.wide_url),
+        },
+        "corners": {},
+    }
+    write_json(path, document)
+    pixels = corner_pixels(width, height)
+    print(f"Wide reference: {run_root / reference_image}", flush=True)
+    print("Giu nguyen zoom. Di chuyen TAM anh PTZ den tung goc Wide roi luu.", flush=True)
+    pending = list(CORNER_ORDER)
+    while True:
+        while pending:
+            name = pending[0]
+            answer = operator.confirm_corner(name) if operator else input(f"{CORNER_LABELS[name]} {pixels[name]}: Enter de luu ONVIF pose, q de dung: ")
+            if answer.strip().lower() == "q":
+                raise CalibrationCancelled(f"Corner recording cancelled; partial coordinates saved to {path}")
+            try:
+                pose = read_stable_pose(
+                    lambda: raw_position(ptz, token, require_zoom=ranges.get("zoom") is not None), ranges,
+                    samples=args.stable_samples, tolerance=args.corner_tolerance, timeout=args.onvif_timeout,
+                )
+                first = document["corners"].get("top_left")
+                if name != "top_left" and first and abs(pose["zoom"] - first["pose"]["zoom"]) > 0.005:
+                    raise ValueError("Zoom da thay doi; hay tra zoom ve muc cua goc tren trai.")
+            except (RuntimeError, ValueError) as exc:
+                print(f"Khong luu: {exc}. Chinh camera roi Enter de thu lai.", flush=True)
+                if operator:
+                    operator.set_message("Khong doc duoc pose on dinh hoac zoom da thay doi. Can lai roi Enter.")
+                continue
+            document["corners"][name] = {"wide_pixel": pixels[name], "pose": pose, "recorded_at_utc": utc_now()}
+            write_json(path, document)
+            if operator:
+                operator.on_corner_saved(name, pose)
+            print(f"Da luu {name}: pan={pose['pan']:.6f}, tilt={pose['tilt']:.6f}, zoom={pose['zoom']:.6f}", flush=True)
+            pending.pop(0)
+        document["status"] = "complete"
+        try:
+            validate_corners(document, width, height, ranges)
+        except ValueError as exc:
+            document["status"] = "incomplete"
+            write_json(path, document)
+            print(f"Bon goc chua hop le: {exc}", flush=True)
+            name = operator.choose_retry_corner(str(exc)) if operator else input("Nhap ten goc de luu lai (top_left/top_right/bottom_right/bottom_left), q de dung: ").strip()
+            if name == "q":
+                raise CalibrationCancelled(f"Invalid corner coordinates saved for review: {path}")
+            if name in CORNER_ORDER:
+                pending.append(name)
+            continue
+        write_json(path, document)
+        print(f"Da luu 4 goc: {path}. Bat dau tu dong chup luoi 5x6.", flush=True)
+        return document
+
+
+def load_wide_corners(
+    args: argparse.Namespace, run_root: Path, wide: dict[str, Any], token: str, ranges: dict[str, Any],
+) -> dict[str, Any]:
+    document = json.loads(args.corners_file.read_text(encoding="utf-8"))
+    validate_corners(document, wide["reference_width"], wide["reference_height"], ranges)
+    camera = document.get("camera", {})
+    if camera.get("onvif_host") != args.ptz_host or camera.get("onvif_port") != args.ptz_port or camera.get("profile_token") != token:
+        raise ValueError("Corner file belongs to a different ONVIF camera or media profile")
+    if document["wide_reference"].get("stream_url") != redact_url(args.wide_url):
+        raise ValueError("Corner file belongs to a different Wide stream")
+    document["source_corner_file"] = str(args.corners_file.resolve())
+    document["wide_reference"]["image"] = "00_wide_current_and_new_set/current_reference/wide_current_reference.jpg"
+    write_json(run_root / "00_corner_anchors" / "wide_corners.json", document)
+    return document
+
+
 def capture_dynamic_grid(args: argparse.Namespace, run_root: Path, wide: dict[str, Any]) -> dict[str, Any]:
     ptz_root = run_root / "01_ptz_overlap_grid"
     raw_dir = ptz_root / "raw"
@@ -167,7 +264,7 @@ def capture_dynamic_grid(args: argparse.Namespace, run_root: Path, wide: dict[st
     records: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     metadata: dict[str, Any] = {
-        "pipeline": "unknown_camera_dynamic_ptz_overlap_grid",
+        "pipeline": "camera_range_grid" if args.auto_ranges else "four_corner_bilinear_ptz_grid",
         "stage": "ptz_overlap_capture",
         "status": "running",
         "started_at_utc": utc_now(),
@@ -193,7 +290,10 @@ def capture_dynamic_grid(args: argparse.Namespace, run_root: Path, wide: dict[st
             "stable_samples": args.stable_samples,
             "retries_per_position": args.retries,
             "raw_images_are_unmodified": True,
-            "invalid_or_stale_status_policy": "retain *_raw and normalize canonical actual_* to commanded target",
+            "invalid_or_stale_status_policy": (
+                "retain *_raw and normalize canonical actual_* to commanded target" if args.auto_ranges
+                else "require measured ONVIF poses before and after capture; reject target fallback"
+            ),
         },
         "captures": records,
         "failures": failures,
@@ -208,51 +308,59 @@ def capture_dynamic_grid(args: argparse.Namespace, run_root: Path, wide: dict[st
         camera, media, profile, token, snapshot_uri, ptz = connect_ptz(args)
         ranges = discover_onvif_ranges(ptz, profile)
         metadata["onvif_position_ranges"] = ranges
-        pan_limits = ranges.get("pan")
-        tilt_limits = ranges.get("tilt")
-        if args.pan_min is not None or args.pan_max is not None:
-            if args.pan_min is None or args.pan_max is None:
-                raise SystemExit("Cần truyền cả --pan-min và --pan-max.")
-            pan_limits = {"min": args.pan_min, "max": args.pan_max}
-        if args.tilt_min is not None or args.tilt_max is not None:
-            if args.tilt_min is None or args.tilt_max is None:
-                raise SystemExit("Cần truyền cả --tilt-min và --tilt-max.")
-            tilt_limits = {"min": args.tilt_min, "max": args.tilt_max}
-        pans = make_axis_values(args.pans, args.pan_count, pan_limits, "pan")
-        tilts = make_axis_values(args.tilts, args.tilt_count, tilt_limits, "tilt")
-        if args.zoom is not None:
-            zoom = float(args.zoom)
-            zoom_source = "command_line"
-        elif ranges.get("zoom") is not None:
-            zoom = float(ranges["zoom"]["min"])
-            zoom_source = "camera_reported_zoom_minimum"
+        if not args.auto_ranges:
+            if args.corners_file:
+                corners = load_wide_corners(args, run_root, wide, token, ranges)
+            else:
+                corners = record_wide_corners(args, run_root, wide, ptz, token, ranges)
+            plan = build_corner_plan(corners, wide["reference_width"], wide["reference_height"], ranges)
+            metadata["corner_anchors"] = "00_corner_anchors/wide_corners.json"
+            metadata["plan_summary"] = {
+                "pan_count": 5, "tilt_count": 6, "capture_count": len(plan),
+                "zoom": corners["corners"]["top_left"]["pose"]["zoom"],
+                "zoom_source": "recorded_corner_pose",
+                "pan_order": "serpentine by Wide row",
+                "range_source": "bilinear interpolation of four manually recorded Wide corner poses",
+                "wide_anchor_source": "interior pixel positions are nominal; recovered from ALIKED/LightGlue/RANSAC",
+            }
         else:
-            zoom = 0.0
-            zoom_source = "fixed_zero_fallback_when_zoom_space_missing"
-        plan = build_plan(pans, tilts, zoom)
-        # ``index`` is the stable identifier consumed by the feature-fitting stage.
-        # ``wide_pixel`` is intentionally absent: before calibration the camera
-        # orientation is unknown, so no false centre prior is injected.
-        for job in plan:
-            job["index"] = int(job["sequence"])
-            job["wide_anchor_policy"] = "estimated_from_feature_mapping_after_capture"
-            job["wide_anchor_fraction_nominal"] = [
-                float(job["column"] / max(len(pans) - 1, 1)),
-                float(job["row"] / max(len(tilts) - 1, 1)),
-            ]
+            pan_limits = ranges.get("pan")
+            tilt_limits = ranges.get("tilt")
+            if args.pan_min is not None or args.pan_max is not None:
+                if args.pan_min is None or args.pan_max is None:
+                    raise ValueError("Cần truyền cả --pan-min và --pan-max.")
+                pan_limits = {"min": args.pan_min, "max": args.pan_max}
+            if args.tilt_min is not None or args.tilt_max is not None:
+                if args.tilt_min is None or args.tilt_max is None:
+                    raise ValueError("Cần truyền cả --tilt-min và --tilt-max.")
+                tilt_limits = {"min": args.tilt_min, "max": args.tilt_max}
+            pans = make_axis_values(args.pans, args.pan_count, pan_limits, "pan")
+            tilts = make_axis_values(args.tilts, args.tilt_count, tilt_limits, "tilt")
+            if args.zoom is not None:
+                zoom = float(args.zoom)
+                zoom_source = "command_line"
+            elif ranges.get("zoom") is not None:
+                zoom = float(ranges["zoom"]["min"])
+                zoom_source = "camera_reported_zoom_minimum"
+            else:
+                zoom = 0.0
+                zoom_source = "fixed_zero_fallback_when_zoom_space_missing"
+            plan = build_plan(pans, tilts, zoom)
+            for job in plan:
+                job["index"] = int(job["sequence"])
+                job["wide_anchor_policy"] = "estimated_from_feature_mapping_after_capture"
+                job["wide_anchor_fraction_nominal"] = [
+                    float(job["column"] / max(len(pans) - 1, 1)),
+                    float(job["row"] / max(len(tilts) - 1, 1)),
+                ]
+            metadata["plan_summary"] = {
+                "pan_count": len(pans), "tilt_count": len(tilts), "capture_count": len(plan),
+                "pan_values": pans, "tilt_values": tilts, "zoom": zoom, "zoom_source": zoom_source,
+                "pan_order": "serpentine by tilt row",
+                "range_source": "camera ONVIF Absolute*PositionSpace unless explicitly overridden",
+                "wide_anchor_source": "not assumed; recovered from ALIKED/LightGlue/RANSAC",
+            }
         metadata["plan"] = plan
-        metadata["plan_summary"] = {
-            "pan_count": len(pans),
-            "tilt_count": len(tilts),
-            "capture_count": len(plan),
-            "pan_values": pans,
-            "tilt_values": tilts,
-            "zoom": zoom,
-            "zoom_source": zoom_source,
-            "pan_order": "serpentine by tilt row",
-            "range_source": "camera ONVIF Absolute*PositionSpace unless explicitly overridden",
-            "wide_anchor_source": "not assumed; recovered from ALIKED/LightGlue/RANSAC",
-        }
         metadata["camera"].update(
             {
                 "profile_name": getattr(profile, "Name", None),
@@ -271,16 +379,23 @@ def capture_dynamic_grid(args: argparse.Namespace, run_root: Path, wide: dict[st
             success = False
             for attempt in range(1, args.retries + 2):
                 try:
+                    validate_pose(target, ranges)
                     request = set_absolute_position(ptz, token, float(target["pan"]), float(target["tilt"]), float(target["zoom"]))
                     ptz.AbsoluteMove(request)
                     before = wait_for_command_pose(
                         ptz, token, target, ranges, args.settle, args.move_timeout,
                         args.tolerance, args.stable_samples,
                     )
+                    if not args.auto_ranges and (
+                        before["wait_fallback"] or before["normalization"]["mode"] != "reported_onvif"
+                    ):
+                        raise RuntimeError("PTZ chưa xác nhận tới điểm lưới bằng ONVIF; không chụp dựa trên pose thay thế.")
                     width, height = capture_frame(reader, raw_path, args.rtsp_timeout)
                     after = read_and_normalize_after_capture(
                         ptz, token, target, ranges, args.onvif_timeout, args.tolerance,
                     )
+                    if not args.auto_ranges and after["normalization"]["mode"] != "reported_onvif":
+                        raise RuntimeError("ONVIF pose sau chụp không hợp lệ; thử lại điểm lưới.")
                     record = {
                         **job,
                         "status": "ok",
@@ -342,6 +457,14 @@ def capture_dynamic_grid(args: argparse.Namespace, run_root: Path, wide: dict[st
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--record-corners", action="store_true", help="Manually record four Wide corners (default).")
+    mode.add_argument("--corners-file", type=Path, help="Reuse four saved corner poses from the same cameras and placement.")
+    mode.add_argument("--auto-ranges", action="store_true", help="Legacy mode: sample camera ONVIF ranges instead of four Wide corners.")
+    parser.add_argument("--preview", action="store_true", help="Show Wide/PTZ together and control PTZ with arrow buttons or WASD.")
+    parser.add_argument("--corner-tolerance", type=float, default=0.005, help="Maximum observed pose spread while recording a corner.")
+    parser.add_argument("--fit", action="store_true", help="After capture succeeds, automatically match images, fit and export the runtime LUT.")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu", help="Device for the optional --fit stage.")
     parser.add_argument("--run-root", type=Path, default=None)
     parser.add_argument("--wide-url", default=os.getenv("WIDE_RTSP_URL"))
     parser.add_argument("--wide-count", type=int, default=8)
@@ -385,6 +508,19 @@ def main() -> int:
         raise SystemExit("--pans phải có ít nhất 3 giá trị.")
     if args.tilts is not None and len(args.tilts) < 3:
         raise SystemExit("--tilts phải có ít nhất 3 giá trị.")
+    if not args.auto_ranges:
+        if args.pan_count != 5 or args.tilt_count != 6:
+            raise SystemExit("Chế độ bốn góc dùng đúng 5 cột × 6 hàng.")
+        if any(value is not None for value in (
+            args.pans, args.tilts, args.pan_min, args.pan_max, args.tilt_min, args.tilt_max, args.zoom,
+        )):
+            raise SystemExit("Chế độ bốn góc lấy vùng quét và zoom từ pose đã lưu; không dùng cấu hình khoảng pan/tilt/zoom riêng.")
+        if args.stable_samples < 2 or not math.isfinite(args.corner_tolerance) or args.corner_tolerance <= 0:
+            raise SystemExit("stable-samples >= 2 và corner-tolerance phải hữu hạn, lớn hơn 0.")
+        if args.corners_file and not args.corners_file.is_file():
+            raise SystemExit(f"Không tìm thấy file bốn góc: {args.corners_file}")
+    elif args.preview:
+        raise SystemExit("--preview dùng với chế độ ghi bốn góc.")
     run_root = (args.run_root or PIPELINE_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}").resolve()
     if run_root.exists() and any(run_root.iterdir()):
         raise SystemExit(f"Output đã có dữ liệu, không ghi đè: {run_root}")
@@ -409,6 +545,20 @@ def main() -> int:
         manifest["stages"].append({"name": "dynamic_ptz_overlap_capture", "status": ptz["status"], "metadata": "01_ptz_overlap_grid/ptz_capture_metadata.json", "summary": ptz.get("summary")})
         manifest["status"] = ptz["status"]
         return_code = 0 if ptz["status"] == "complete" else 2
+        if args.fit and return_code == 0:
+            manifest["status"] = "running"
+            write_json(manifest_path, manifest)
+            subprocess.run([
+                sys.executable, str(PIPELINE_DIR / "run_mapping_pipeline.py"),
+                "--run-root", str(run_root), "--device", args.device,
+            ], cwd=PIPELINE_DIR, check=True)
+            output = run_root / "03_polynomial_wide_to_grid" / "polynomial_wide_pixel_to_ptz_mapping.json"
+            manifest["stages"].append({"name": "fit_and_export_runtime_lut", "status": "complete", "output": str(output)})
+            manifest["runtime_lut"] = str(output)
+            manifest["status"] = "complete"
+    except (KeyboardInterrupt, CalibrationCancelled):
+        manifest["status"] = "interrupted"
+        return_code = 130
     except Exception as exc:  # noqa: BLE001 - persist failure in manifest
         manifest["status"] = "failed"
         manifest["error_type"] = type(exc).__name__

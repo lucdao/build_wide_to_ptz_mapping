@@ -1,0 +1,14 @@
+{
+  "models": [
+    {
+      "filename": "aliked-n16.pth",
+      "url": "https://huggingface.co/kornia/aliked/resolve/0e6209632e05e1f4e30908b63997870124985e9b/aliked-n16.pth",
+      "sha256": "5be8704840ed662d9d8c561bf7279c222092674e7eb05fd0feab94899e9d82f2"
+    },
+    {
+      "filename": "aliked_lightglue_v0-1_arxiv-pth",
+      "url": "https://huggingface.co/kornia/lightglue/resolve/68c04837a6fe52a082beb1fecded7438a99c8496/aliked_lightglue.pth",
+      "sha256": "d975e965b105311a6143194852297dff4f02aea5cc2e10cecfed966ca0e22503"
+    }
+  ]
+}

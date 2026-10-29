@@ -696,6 +696,8 @@ def main() -> int:
         for index, item in enumerate(wide_items):
             path = run_root / item["image"]
             record = extract_features(f"wide_{index:02d}", path, extractor, args.max_side, device, feature_dir)
+            if wide_features and (record.width, record.height) != (wide_features[0].width, wide_features[0].height):
+                raise RuntimeError("Các ảnh Wide phải cùng độ phân giải để dùng chung tọa độ pixel LUT.")
             wide_features.append(record)
             print(f"  Wide {index + 1}/{len(wide_items)}: {record.keypoints_original.shape[0]} keypoints", flush=True)
 
@@ -756,10 +758,11 @@ def main() -> int:
                     matched_ptz,
                     mask,
                 )
+                prior_label = "disabled" if winner["center_prior_error_px"] is None else f"{winner['center_prior_error_px']:.1f}px"
                 print(
                     f"  PTZ {capture_number:02d}/{len(captures)}: selected {winner['wide_id']} "
                     f"({winner['inliers']} inliers, centre prior "
-                    f"{('disabled' if winner['center_prior_error_px'] is None else f'{winner['center_prior_error_px']:.1f}px')})",
+                    f"{prior_label})",
                     flush=True,
                 )
             else:

@@ -2,6 +2,7 @@
 runs/
 run_*/
 validation_*/
+output/
 *.jpg
 *.jpeg
 *.png
@@ -12,6 +13,7 @@ validation_*/
 
 # Local environment and credentials
 .venv/
+.runtime/
 venv/
 .env
 .env.*

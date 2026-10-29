@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Fit a robust Polynomial Wide-pixel -> PTZ-grid model.
 
-This is an experiment stage. It keeps the 30 local PTZ->Wide homographies and
-replaces only the global Wide->grid homography. The following grid->pose
-surface is reused from the selected mapping run.
+It keeps the local PTZ->Wide homographies and replaces only the global
+Wide->grid homography. The final JSON uses the LUT_camera_release schema:
+a quadratic coefficient array, a 6x5 pose grid, and PCHIP interpolation.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ import cv2
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
+from export_runtime_lut import build_runtime_model
+
 
 PIPELINE_DIR = Path(__file__).resolve().parent
 
@@ -29,7 +31,7 @@ def utc_now() -> str:
 
 
 def write_json(path: Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
 
 
 def term_powers(degree: int) -> list[tuple[int, int]]:
@@ -245,7 +247,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--max-degree", type=int, default=2, choices=(1, 2, 3))
+    parser.add_argument("--max-degree", type=int, default=2, choices=(1, 2), help="Runtime supports linear/quadratic fits; linear winners are zero-padded to 6 terms.")
     parser.add_argument("--ransac-threshold", type=float, default=0.35, help="Grid-coordinate residual threshold.")
     parser.add_argument("--ransac-iterations", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=20260914)
@@ -254,6 +256,10 @@ def main() -> int:
     run_root = args.run_root.resolve()
     source_mapping_path = run_root / "02_aliked_lightglue_wide_ptz_mapping" / "wide_pixel_to_ptz_mapping.json"
     source_mapping = json.loads(source_mapping_path.read_text(encoding="utf-8"))
+    source_model = source_mapping["model"]
+    grid = np.asarray(source_model["state_grid_actual_after_capture"], dtype=np.float64)
+    if grid.shape != (6, 5, 3) or not np.isfinite(grid).all():
+        raise RuntimeError("LUT_camera_release cần pose grid 6x5x3 hữu hạn: 5 pan × 6 tilt. Không đổi cỡ lưới bằng nội suy.")
     pairs = sorted(source_mapping.get("centre_pairs", []), key=lambda item: int(item["ptz_index"]))
     required_points = len(term_powers(args.max_degree))
     if len(pairs) < required_points:
@@ -268,8 +274,14 @@ def main() -> int:
     if wide_image is None:
         raise RuntimeError(f"Không đọc được Wide image: {wide_path}")
     height, width = wide_image.shape[:2]
+    for image_name in {item["wide_image"] for item in pairs}:
+        image = cv2.imread(str(run_root / image_name), cv2.IMREAD_COLOR)
+        if image is None or image.shape[:2] != (height, width):
+            raise RuntimeError(f"Mọi ảnh Wide phải cùng độ phân giải {width}x{height}: {image_name}")
     centres = np.asarray([item["mapped_ptz_center_on_wide"] for item in pairs], dtype=np.float64)
     targets = np.asarray([[item["column"], item["row"]] for item in pairs], dtype=np.float64)
+    if not np.isfinite(centres).all() or not ((targets >= 0).all() and (targets[:, 0] <= 4).all() and (targets[:, 1] <= 5).all()):
+        raise RuntimeError("Centre pairs phải hữu hạn và nằm trong lưới u=0..4, v=0..5.")
     centres_normalized = normalize_points(centres, width, height)
 
     output_dir = (args.output_dir or run_root / f"03_polynomial_grid_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}").resolve()
@@ -292,15 +304,17 @@ def main() -> int:
         models.append(model)
 
     winner = min(models, key=lambda item: (float(item["loo_rmse_inliers"]), int(item["degree"])))
-    powers = winner["powers"]
     winner_predicted = predict(winner["features"], winner["coefficients"])
 
-    source_model = source_mapping["model"]
-    grid = np.asarray(source_model["state_grid_actual_after_capture"], dtype=np.float64)
-    if grid.ndim != 3 or grid.shape[0] < 2 or grid.shape[1] < 2 or grid.shape[2] != 3:
-        raise RuntimeError(f"Pose grid phải có shape (rows>=2, columns>=2, 3), nhận {grid.shape}.")
+    runtime_model = build_runtime_model({
+        **source_model,
+        "degree": int(winner["degree"]),
+        "terms_powers_xy": [[int(i), int(j)] for i, j in winner["powers"]],
+        "coefficients_uv": np.asarray(winner["coefficients"], dtype=np.float64).tolist(),
+        "input_normalization": {"width": width, "height": height},
+    })
     affine_coefficients = np.asarray(source_model["linearity_probe"]["affine_coefficients_intercept_u_v"], dtype=np.float64)
-    surface = PoseSurface(grid, source_model["state_surface"], affine_coefficients)
+    surface = PoseSurface(grid, runtime_model["state_surface"], affine_coefficients)
 
     rows: list[dict[str, Any]] = []
     centre_predictions: list[dict[str, Any]] = []
@@ -358,30 +372,10 @@ def main() -> int:
 
     polynomial_mapping = {
         "status": "complete",
-        "pipeline": "local H_i unchanged + robust Polynomial Wide pixel -> PTZ grid + existing pose surface",
+        "pipeline": "local H_i unchanged + robust Polynomial Wide pixel -> PTZ grid + PCHIP pose surface",
         "source_run": str(run_root),
         "source_mapping": str(source_mapping_path),
-        "model": {
-            "mapping_type": "polynomial_wide_pixel_to_ptz_lattice",
-            "degree": int(winner["degree"]),
-            "terms_powers_xy": [[int(i), int(j)] for i, j in powers],
-            "coefficients_uv": np.asarray(winner["coefficients"], dtype=np.float64).tolist(),
-            "input_normalization": {
-                "x": "(pixel_x - width/2) / (width/2)",
-                "y": "(pixel_y - height/2) / (height/2)",
-                "width": width,
-                "height": height,
-            },
-            "lattice_definition": {
-                "u": f"PTZ grid column 0..{int(np.max(targets[:, 0]))}",
-                "v": f"PTZ grid row 0..{int(np.max(targets[:, 1]))}",
-                "columns": int(np.max(targets[:, 0])) + 1,
-                "rows": int(np.max(targets[:, 1])) + 1,
-            },
-            "state_surface": source_model["state_surface"],
-            "state_grid_actual_after_capture": grid.tolist(),
-            "linearity_probe": source_model["linearity_probe"],
-        },
+        "global_mapping": runtime_model,
         "fit_quality": {
             "fit_sample_count": len(pairs),
             "selected_degree": int(winner["degree"]),
@@ -407,6 +401,9 @@ def main() -> int:
         f"Giữ nguyên {len(pairs)} homography cục bộ `H_i` dùng để lấy tâm PTZ trên Wide.\n"
         "Chỉ thay tầng toàn cục `Wide pixel -> PTZ grid` bằng Polynomial robust.\n\n"
         f"- Bậc được chọn: {int(winner['degree'])}.\n"
+        "- JSON runtime dùng `global_mapping`, 6×2 hệ số và lưới pose 6×5×3.\n"
+        "- Nếu chọn bậc 1, ba hàng hệ số bậc hai được điền 0; phép ánh xạ được giữ nguyên.\n"
+        "- Nội suy pose luôn là PCHIP để khớp C++ runtime.\n"
         f"- Inlier: {int(winner['inlier_count'])}/{len(pairs)}.\n"
         f"- Polynomial RMSE: {float(winner['rmse_all']):.6f} grid units.\n"
         f"- Homography baseline RMSE: {float(np.sqrt(np.mean(baseline_errors**2))):.6f} grid units.\n"

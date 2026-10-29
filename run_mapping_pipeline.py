@@ -85,7 +85,7 @@ def main() -> int:
         str(args.seed),
     ]
     run_step("global polynomial", fit_command)
-    print(f"[complete] mapping: {output_dir / 'polynomial_wide_pixel_to_ptz_mapping.json'}", flush=True)
+    print(f"[complete] LUT_camera_release input: {output_dir / 'polynomial_wide_pixel_to_ptz_mapping.json'}", flush=True)
     return 0
 
 
